@@ -1,3 +1,4 @@
+use crate::types::{DisplayHistory, DisplayHistoryURL};
 use anyhow::{Context, bail};
 use qrcode_generator::QrCodeEcc;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
@@ -6,7 +7,7 @@ use std::time::Duration;
 use tokio::fs::{read_to_string, remove_file, try_exists, write};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, instrument, warn};
 
 #[derive(Default, Clone)]
 pub struct Client {
@@ -31,6 +32,9 @@ impl Client {
     }
     async fn get_rc(&self) -> reqwest::Client {
         self.rc.lock().await.clone()
+    }
+    async fn get_mid(&self) -> i64 {
+        *self.mid.lock().await
     }
     async fn build_rc(&self) {
         let mut map = HeaderMap::new();
@@ -82,6 +86,55 @@ impl Client {
         let mut client = Self { ..Self::default() };
         client.read_file_cookie().await?;
         Ok(client)
+    }
+    #[instrument(skip_all)]
+    pub async fn get_recent_upvotes(&self) -> anyhow::Result<Vec<DisplayHistory>> {
+        let resp: serde_json::Value = self
+            .get_rc()
+            .await
+            .get(format!(
+                "https://api.bilibili.com/x/space/like/video?vmid={}",
+                self.get_mid().await
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        debug!(?resp);
+        let arr = resp["data"]["list"]
+            .as_array()
+            .context("data is not an array")?
+            .iter()
+            .map(|item| {
+                let bid = item["bvid"].as_str().context("no bvid")?;
+                let title = item["title"].as_str().context("no title")?;
+                Ok(DisplayHistory {
+                    bid: bid.to_string(),
+                    title: title.to_string(),
+                    url: DisplayHistoryURL::from_bid(bid),
+                })
+            })
+            .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
+        Ok(arr)
+    }
+    #[instrument(skip_all)]
+    pub async fn get_recent_view(&self) -> anyhow::Result<Vec<DisplayHistory>> {
+        let resp: serde_json::Value = self
+            .get_rc()
+            .await
+            .get("https://api.bilibili.com/x/web-interface/history/cursor")
+            .send()
+            .await?
+            .json()
+            .await?;
+        debug!(?resp);
+        let arr = resp["data"]["list"]
+            .as_array()
+            .context("data is not an array")?
+            .iter()
+            .filter_map(|item| todo!())
+            .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
+        Ok(arr)
     }
     pub async fn login(&self) -> anyhow::Result<()> {
         let resp: serde_json::Value = self

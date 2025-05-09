@@ -1,5 +1,6 @@
 mod bili;
 mod db;
+mod types;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -14,4 +15,5 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
     let mut client = bili::Client::new().await.unwrap();
+    dbg!(client.get_recent_upvotes().await.unwrap());
 }

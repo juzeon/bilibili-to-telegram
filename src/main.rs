@@ -15,5 +15,5 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
     let mut client = bili::Client::new().await.unwrap();
-    dbg!(client.get_recent_view().await.unwrap());
+    client.cron_job().await.unwrap()
 }

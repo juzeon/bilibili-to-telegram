@@ -5,6 +5,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
 };
 
+#[derive(Clone)]
 pub struct DB {
     db: DatabaseConnection,
 }

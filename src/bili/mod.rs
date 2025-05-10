@@ -1,23 +1,38 @@
-use crate::types::{DisplayHistory, DisplayHistoryURL};
+use crate::db::DB;
+use crate::types::{Config, DisplayHistory, DisplayHistoryURL};
 use anyhow::{Context, Error, anyhow, bail};
 use qrcode_generator::QrCodeEcc;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use teloxide::Bot;
 use tokio::fs::{read_to_string, remove_file, try_exists, write};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, warn};
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Client {
     rc: Arc<Mutex<reqwest::Client>>,
     cookie: Arc<Mutex<String>>,
     mid: Arc<Mutex<i64>>,
+    config: Arc<Config>,
+    bot: Bot,
+    db: DB,
 }
 impl Client {
     pub async fn new() -> anyhow::Result<Client> {
-        let client = Self { ..Self::default() };
+        let config = Config::from_file().await;
+        let bot = Bot::new(config.token.as_str());
+        let client = Self {
+            config: Arc::new(config),
+            bot,
+            rc: Arc::default(),
+            cookie: Arc::default(),
+            mid: Arc::default(),
+            db: DB::new().await,
+        };
         client.build_rc().await;
         if try_exists("cookie.txt").await? {
             client.read_file_cookie().await?;
@@ -81,11 +96,6 @@ impl Client {
     async fn write_file_cookie(&self) {
         let cookie = self.cookie.lock().await;
         write("cookie.txt", cookie.as_str()).await.unwrap();
-    }
-    pub async fn load() -> anyhow::Result<Client> {
-        let mut client = Self { ..Self::default() };
-        client.read_file_cookie().await?;
-        Ok(client)
     }
     #[instrument(skip_all)]
     pub async fn get_recent_upvotes(&self) -> anyhow::Result<Vec<DisplayHistory>> {
@@ -153,6 +163,65 @@ impl Client {
             })
             .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
         Ok(arr)
+    }
+    pub async fn cron_job(&self) -> anyhow::Result<()> {
+        let view_fut = self.get_recent_view();
+        let upvotes_fut = self.get_recent_upvotes();
+        let (view_arr, upvotes_arr) = tokio::try_join!(view_fut, upvotes_fut)?;
+
+        // 1. send all newly appeared upvoted videos
+        let mut to_send_arr: Vec<DisplayHistory> = vec![];
+        let mut to_save_viewed_arr: Vec<DisplayHistory> = vec![];
+        let existing_arr = self
+            .db
+            .find_history_by_bids(
+                &view_arr
+                    .iter()
+                    .chain(upvotes_arr.iter())
+                    .map(|item| item.bid.to_string())
+                    .collect::<Vec<String>>(),
+            )
+            .await;
+        let existing_bid_set = existing_arr
+            .iter()
+            .map(|item| item.bid.clone())
+            .collect::<HashSet<_>>();
+        to_send_arr.extend(upvotes_arr.iter().filter_map(|item| {
+            if existing_bid_set.contains(&item.bid) {
+                return None;
+            }
+            Some(item.clone())
+        }));
+
+        // 2. check for viewed videos (database and newly appeared):
+        // 1) if appeared in the upvote list, then update and send
+        // 2) if timeout exceeded, then send and update
+        let combined_viewed_arr = {
+            let mut arr = existing_arr
+                .iter()
+                .filter_map(|item| match item.source.as_str() {
+                    "view" => Some(DisplayHistory {
+                        bid: item.bid.to_string(),
+                        title: item.title.to_string(),
+                        url: DisplayHistoryURL::from_bid(&item.bid),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            arr.extend(view_arr.iter().filter_map(|item| {
+                if existing_bid_set.contains(&item.bid) {
+                    return None;
+                }
+                Some(item.clone())
+            }));
+            arr
+        };
+        for item in combined_viewed_arr{
+            
+        }
+
+        // 3. save the database using to_send_arr
+        todo!()
     }
     pub async fn login(&self) -> anyhow::Result<()> {
         let resp: serde_json::Value = self

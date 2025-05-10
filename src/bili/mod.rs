@@ -1,5 +1,5 @@
 use crate::types::{DisplayHistory, DisplayHistoryURL};
-use anyhow::{Context, bail};
+use anyhow::{Context, Error, anyhow, bail};
 use qrcode_generator::QrCodeEcc;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
 use std::sync::Arc;
@@ -132,7 +132,25 @@ impl Client {
             .as_array()
             .context("data is not an array")?
             .iter()
-            .filter_map(|item| todo!())
+            .filter_map(|item| -> Option<anyhow::Result<DisplayHistory>> {
+                // Option<Result<T>>
+                let bvid = match item["history"]["bvid"].as_str() {
+                    Some(v) => v,
+                    None => return Some(Err(anyhow!("bvid not str"))),
+                };
+                if bvid.is_empty() {
+                    return None;
+                }
+                let title = match item["title"].as_str() {
+                    Some(v) => v,
+                    None => return Some(Err(anyhow!("title not str"))),
+                };
+                Some(Ok(DisplayHistory {
+                    bid: bvid.to_string(),
+                    title: title.to_string(),
+                    url: DisplayHistoryURL::from_bid(bvid),
+                }))
+            })
             .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
         Ok(arr)
     }

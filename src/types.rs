@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 use tokio::fs::read_to_string;
 
 #[derive(Debug, Clone)]
@@ -16,6 +17,11 @@ impl DisplayHistoryURL {
         } else {
             unimplemented!("bid unimpl")
         }
+    }
+}
+impl Display for DisplayHistoryURL {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

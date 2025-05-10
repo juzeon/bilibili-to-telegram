@@ -1,12 +1,17 @@
 use crate::db::DB;
+use crate::db::entity::history;
 use crate::types::{Config, DisplayHistory, DisplayHistoryURL};
 use anyhow::{Context, Error, anyhow, bail};
 use qrcode_generator::QrCodeEcc;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE, USER_AGENT};
+use sea_orm::{ActiveValue, IntoActiveModel};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::Bot;
+use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::Requester;
+use teloxide::types::ParseMode;
 use tokio::fs::{read_to_string, remove_file, try_exists, write};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -98,7 +103,7 @@ impl Client {
         write("cookie.txt", cookie.as_str()).await.unwrap();
     }
     #[instrument(skip_all)]
-    pub async fn get_recent_upvotes(&self) -> anyhow::Result<Vec<DisplayHistory>> {
+    pub async fn get_recent_upvotes(&self) -> anyhow::Result<Vec<history::Model>> {
         let resp: serde_json::Value = self
             .get_rc()
             .await
@@ -118,17 +123,20 @@ impl Client {
             .map(|item| {
                 let bid = item["bvid"].as_str().context("no bvid")?;
                 let title = item["title"].as_str().context("no title")?;
-                Ok(DisplayHistory {
-                    bid: bid.to_string(),
+                Ok(history::Model {
+                    id: 0,
                     title: title.to_string(),
-                    url: DisplayHistoryURL::from_bid(bid),
+                    bid: bid.to_string(),
+                    source: "upvote".to_string(),
+                    created_at: chrono::Local::now().to_rfc3339(),
+                    is_sent: 0,
                 })
             })
-            .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
+            .collect::<anyhow::Result<Vec<history::Model>>>()?;
         Ok(arr)
     }
     #[instrument(skip_all)]
-    pub async fn get_recent_view(&self) -> anyhow::Result<Vec<DisplayHistory>> {
+    pub async fn get_recent_view(&self) -> anyhow::Result<Vec<history::Model>> {
         let resp: serde_json::Value = self
             .get_rc()
             .await
@@ -142,7 +150,7 @@ impl Client {
             .as_array()
             .context("data is not an array")?
             .iter()
-            .filter_map(|item| -> Option<anyhow::Result<DisplayHistory>> {
+            .filter_map(|item| -> Option<anyhow::Result<history::Model>> {
                 // Option<Result<T>>
                 let bvid = match item["history"]["bvid"].as_str() {
                     Some(v) => v,
@@ -155,73 +163,94 @@ impl Client {
                     Some(v) => v,
                     None => return Some(Err(anyhow!("title not str"))),
                 };
-                Some(Ok(DisplayHistory {
-                    bid: bvid.to_string(),
+                Some(Ok(history::Model {
+                    id: 0,
                     title: title.to_string(),
-                    url: DisplayHistoryURL::from_bid(bvid),
+                    bid: bvid.to_string(),
+                    source: "view".to_string(),
+                    created_at: chrono::Local::now().to_rfc3339(),
+                    is_sent: 0,
                 }))
             })
-            .collect::<anyhow::Result<Vec<DisplayHistory>>>()?;
+            .collect::<anyhow::Result<Vec<history::Model>>>()?;
         Ok(arr)
+    }
+    pub async fn send_to_tg(&self, history: &history::Model) -> anyhow::Result<()> {
+        self.bot
+            .send_message(
+                self.config.chat_id.to_string(),
+                format!(
+                    "<b>{}</b>\n{}\nAt: <i>{}</i>",
+                    history.title,
+                    DisplayHistoryURL::from_bid(&history.bid),
+                    history.created_at
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+        sleep(Duration::from_secs(1)).await;
+        Ok(())
     }
     pub async fn cron_job(&self) -> anyhow::Result<()> {
         let view_fut = self.get_recent_view();
-        let upvotes_fut = self.get_recent_upvotes();
-        let (view_arr, upvotes_arr) = tokio::try_join!(view_fut, upvotes_fut)?;
+        let upvote_fut = self.get_recent_upvotes();
+        let (view_arr, upvote_arr) = tokio::try_join!(view_fut, upvote_fut)?;
 
         // 1. send all newly appeared upvoted videos
-        let mut to_send_arr: Vec<DisplayHistory> = vec![];
-        let mut to_save_viewed_arr: Vec<DisplayHistory> = vec![];
+        let mut to_send_arr: Vec<history::Model> = vec![];
+        let mut to_save_view_arr: Vec<history::Model> = vec![];
         let existing_arr = self
             .db
             .find_history_by_bids(
                 &view_arr
                     .iter()
-                    .chain(upvotes_arr.iter())
+                    .chain(upvote_arr.iter())
                     .map(|item| item.bid.to_string())
                     .collect::<Vec<String>>(),
             )
             .await;
-        let existing_bid_set = existing_arr
-            .iter()
-            .map(|item| item.bid.clone())
-            .collect::<HashSet<_>>();
-        to_send_arr.extend(upvotes_arr.iter().filter_map(|item| {
-            if existing_bid_set.contains(&item.bid) {
-                return None;
+        to_send_arr.extend(upvote_arr.iter().filter_map(|upvote_item| {
+            let x = existing_arr.iter().find(|x| x.bid == upvote_item.bid);
+            let x = match x {
+                None => return Some(upvote_item.clone()),
+                Some(v) => v,
+            };
+            if x.is_sent == 0 {
+                Some(upvote_item.clone())
+            } else {
+                None
             }
-            Some(item.clone())
         }));
 
-        // 2. check for viewed videos (database and newly appeared):
-        // 1) if appeared in the upvote list, then update and send
-        // 2) if timeout exceeded, then send and update
-        let combined_viewed_arr = {
-            let mut arr = existing_arr
-                .iter()
-                .filter_map(|item| match item.source.as_str() {
-                    "view" => Some(DisplayHistory {
-                        bid: item.bid.to_string(),
-                        title: item.title.to_string(),
-                        url: DisplayHistoryURL::from_bid(&item.bid),
-                    }),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            arr.extend(view_arr.iter().filter_map(|item| {
-                if existing_bid_set.contains(&item.bid) {
-                    return None;
-                }
-                Some(item.clone())
-            }));
-            arr
-        };
-        for item in combined_viewed_arr{
-            
+        debug!(?to_send_arr);
+
+        for item in to_send_arr.iter() {
+            self.send_to_tg(item).await?;
+            let mut active_item = item.clone().into_active_model();
+            active_item.is_sent = ActiveValue::Set(1);
+            active_item.id = ActiveValue::NotSet;
+            self.db.update_history(active_item).await;
         }
 
-        // 3. save the database using to_send_arr
-        todo!()
+        // 2. check for unsent viewed videos (database and newly appeared):
+        // 1) if appeared in the upvote list, then update and send
+        // 2) if timeout exceeded, then send and update
+        // let combined_view_arr = {
+        //     let mut arr = existing_arr
+        //         .iter()
+        //         .filter(|&item| item.source.as_str() == "view")
+        //         .collect::<Vec<_>>();
+        //     arr.extend(
+        //         view_arr
+        //             .iter()
+        //             .filter(|&item| !existing_bid_set.contains(&item.bid)),
+        //     );
+        //     arr
+        // };
+        // for item in combined_view_arr {}
+        //
+        // // 3. save the database using to_send_arr
+        Ok(())
     }
     pub async fn login(&self) -> anyhow::Result<()> {
         let resp: serde_json::Value = self
